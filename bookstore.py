@@ -1300,7 +1300,7 @@ class DB:
             all_days = sorted(set(sales.keys()) | set(returns.keys()), reverse=True)
             for d in all_days:
                 rev_i, tax_i, scnt = sales.get(d, (0, 0, 0))
-                refund, refund_tax, rcnt = returns.get(d, (0, 0, 0))
+                refund, rcnt = returns.get(d, (0, 0))
                 net = rev_i - refund
                 net_tax = tax_i - refund_tax
                 out.append((d, int(scnt or 0), rcnt, rev_i, refund, net, net_tax))
@@ -1323,22 +1323,20 @@ class DB:
 
             cur.execute("""
                 SELECT substr(created_at,1,7) AS month,
-                       SUM(refund_cents) AS refund_cents,
-                       SUM(refund_tax_cents) AS refund_tax_cents
+                       SUM(refund_cents) AS refund_cents
                 FROM returns
                 GROUP BY month
                 ORDER BY month DESC;
             """)
-            returns = {a: (int(b or 0), int(c or 0)) for (a, b, c) in cur.fetchall()}
+            returns = {a: int(b or 0) for (a, b) in cur.fetchall()}
 
             out = []
             all_months = sorted(set(sales.keys()) | set(returns.keys()), reverse=True)
             for month in all_months:
                 rev, tax, scnt = sales.get(month, (0, 0, 0))
-                refund, refund_tax = returns.get(month, (0, 0))
+                refund = returns.get(month, 0)
                 net_rev = rev - refund
-                net_tax = tax - refund_tax
-                out.append((month, net_rev, net_tax, scnt))
+                out.append((month, net_rev, tax, scnt))
             return out
 
     def report_top_books(self, limit: int = 10):
