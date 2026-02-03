@@ -324,6 +324,10 @@ def fetch_book_price_google(isbn: str, api_key: Optional[str] = None) -> Tuple[O
     if not data:
         if error == "HTTP 429":
             return None, "rate limited (set a Google Books API key to increase quota)"
+        if error == "HTTP 403":
+            if api_key:
+                return None, "forbidden (check Google Books API key restrictions)"
+            return None, "forbidden (set a Google Books API key to increase quota)"
         return None, error or "no response"
 
     price = parse_google_books_price(data)
