@@ -1271,6 +1271,7 @@ class DB:
         start = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
         with self._connect() as conn:
             cur = conn.cursor()
+            has_refund_tax = "refund_tax_cents" in self._columns(conn, "returns")
             cur.execute("""
                 SELECT substr(created_at,1,10) AS day,
                        SUM(total_cents) AS revenue_cents,
@@ -1284,23 +1285,35 @@ class DB:
             sales_rows = cur.fetchall()
             sales = {d: (int(rev or 0), int(tax or 0), int(scnt or 0)) for (d, rev, tax, scnt) in sales_rows}
 
-            cur.execute("""
-                SELECT substr(created_at,1,10) AS day,
-                       SUM(refund_cents) AS refund_cents,
-                       SUM(refund_tax_cents) AS refund_tax_cents,
-                       COUNT(*) AS return_count
-                FROM returns
-                WHERE substr(created_at,1,10) >= ?
-                GROUP BY day
-                ORDER BY day DESC;
-            """, (start,))
-            returns = {d: (int(rc or 0), int(rtax or 0), int(cnt or 0)) for (d, rc, rtax, cnt) in cur.fetchall()}
+            if has_refund_tax:
+                cur.execute("""
+                    SELECT substr(created_at,1,10) AS day,
+                           SUM(refund_cents) AS refund_cents,
+                           SUM(refund_tax_cents) AS refund_tax_cents,
+                           COUNT(*) AS return_count
+                    FROM returns
+                    WHERE substr(created_at,1,10) >= ?
+                    GROUP BY day
+                    ORDER BY day DESC;
+                """, (start,))
+                returns = {d: (int(rc or 0), int(rtax or 0), int(cnt or 0)) for (d, rc, rtax, cnt) in cur.fetchall()}
+            else:
+                cur.execute("""
+                    SELECT substr(created_at,1,10) AS day,
+                           SUM(refund_cents) AS refund_cents,
+                           COUNT(*) AS return_count
+                    FROM returns
+                    WHERE substr(created_at,1,10) >= ?
+                    GROUP BY day
+                    ORDER BY day DESC;
+                """, (start,))
+                returns = {d: (int(rc or 0), 0, int(cnt or 0)) for (d, rc, cnt) in cur.fetchall()}
 
             out = []
             all_days = sorted(set(sales.keys()) | set(returns.keys()), reverse=True)
             for d in all_days:
                 rev_i, tax_i, scnt = sales.get(d, (0, 0, 0))
-                refund, rcnt = returns.get(d, (0, 0))
+                refund, refund_tax, rcnt = returns.get(d, (0, 0, 0))
                 net = rev_i - refund
                 net_tax = tax_i - refund_tax
                 out.append((d, int(scnt or 0), rcnt, rev_i, refund, net, net_tax))
@@ -1309,6 +1322,7 @@ class DB:
     def report_monthly(self):
         with self._connect() as conn:
             cur = conn.cursor()
+            has_refund_tax = "refund_tax_cents" in self._columns(conn, "returns")
             cur.execute("""
                 SELECT substr(created_at,1,7) AS month,
                        SUM(total_cents) AS revenue_cents,
@@ -1321,22 +1335,34 @@ class DB:
             """)
             sales = {a: (int(b or 0), int(c or 0), int(d or 0)) for (a, b, c, d) in cur.fetchall()}
 
-            cur.execute("""
-                SELECT substr(created_at,1,7) AS month,
-                       SUM(refund_cents) AS refund_cents
-                FROM returns
-                GROUP BY month
-                ORDER BY month DESC;
-            """)
-            returns = {a: int(b or 0) for (a, b) in cur.fetchall()}
+            if has_refund_tax:
+                cur.execute("""
+                    SELECT substr(created_at,1,7) AS month,
+                           SUM(refund_cents) AS refund_cents,
+                           SUM(refund_tax_cents) AS refund_tax_cents
+                    FROM returns
+                    GROUP BY month
+                    ORDER BY month DESC;
+                """)
+                returns = {a: (int(b or 0), int(c or 0)) for (a, b, c) in cur.fetchall()}
+            else:
+                cur.execute("""
+                    SELECT substr(created_at,1,7) AS month,
+                           SUM(refund_cents) AS refund_cents
+                    FROM returns
+                    GROUP BY month
+                    ORDER BY month DESC;
+                """)
+                returns = {a: (int(b or 0), 0) for (a, b) in cur.fetchall()}
 
             out = []
             all_months = sorted(set(sales.keys()) | set(returns.keys()), reverse=True)
             for month in all_months:
                 rev, tax, scnt = sales.get(month, (0, 0, 0))
-                refund = returns.get(month, 0)
+                refund, refund_tax = returns.get(month, (0, 0))
                 net_rev = rev - refund
-                out.append((month, net_rev, tax, scnt))
+                net_tax = tax - refund_tax
+                out.append((month, net_rev, net_tax, scnt))
             return out
 
     def report_top_books(self, limit: int = 10):
@@ -2784,6 +2810,8 @@ class App:
         path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")], title="Export Tax CSV")
         if not path:
             return
+        with self.db._connect() as conn:
+            has_refund_tax = "refund_tax_cents" in self.db._columns(conn, "returns")
         q = """
             WITH sales_daily AS (
                 SELECT substr(created_at,1,10) AS day,
@@ -2795,8 +2823,8 @@ class App:
             ),
             returns_daily AS (
                 SELECT substr(created_at,1,10) AS day,
-                       SUM(refund_tax_cents) AS refund_tax_cents,
-                       SUM(refund_cents) AS refund_cents
+                       SUM(refund_cents) AS refund_cents,
+                       SUM({refund_tax_col}) AS refund_tax_cents
                 FROM returns
                 GROUP BY day
             )
@@ -2813,6 +2841,8 @@ class App:
             LEFT JOIN sales_daily ON sales_daily.day = returns_daily.day
             ORDER BY day DESC;
         """
+        refund_tax_col = "refund_tax_cents" if has_refund_tax else "0"
+        q = q.format(refund_tax_col=refund_tax_col)
         self.db.export_table_to_csv(q, ["day", "tax_cents", "total_cents"], path)
         messagebox.showinfo("Exported", f"Saved:\n{path}")
 
