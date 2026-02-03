@@ -238,6 +238,46 @@ def parse_scan_isbn_and_price(raw: str) -> Tuple[Optional[str], Optional[str]]:
     return isbn, price
 
 
+def parse_google_books_price(data: Dict[str, Any]) -> Optional[str]:
+    if not data:
+        return None
+
+    def read_price(entry: Any) -> Optional[float]:
+        if not isinstance(entry, dict):
+            return None
+        amount = entry.get("amount")
+        if isinstance(amount, (int, float)):
+            return float(amount)
+        micros = entry.get("amountInMicros")
+        if isinstance(micros, (int, float)):
+            return float(micros) / 1_000_000
+        return None
+
+    items = data.get("items") or []
+    if not items:
+        return None
+
+    item = items[0] or {}
+    sale_info = item.get("saleInfo") or {}
+    for key in ("listPrice", "retailPrice"):
+        amount = read_price(sale_info.get(key))
+        if amount is not None:
+            return f"{amount:.2f}"
+
+    offers = sale_info.get("offers") or []
+    for offer in offers:
+        for key in ("listPrice", "retailPrice"):
+            amount = read_price(offer.get(key))
+            if amount is not None:
+                return f"{amount:.2f}"
+
+    volume_info = item.get("volumeInfo") or {}
+    amount = read_price(volume_info.get("listPrice"))
+    if amount is not None:
+        return f"{amount:.2f}"
+    return None
+
+
 def fetch_book_price_google(isbn: str) -> Optional[str]:
     """
     Lookup book pricing via Google Books API.
@@ -255,16 +295,7 @@ def fetch_book_price_google(isbn: str) -> Optional[str]:
     except Exception:
         return None
 
-    items = data.get("items") or []
-    if not items:
-        return None
-    sale_info = items[0].get("saleInfo") or {}
-    for key in ("listPrice", "retailPrice"):
-        entry = sale_info.get(key) or {}
-        amount = entry.get("amount")
-        if isinstance(amount, (int, float)):
-            return f"{float(amount):.2f}"
-    return None
+    return parse_google_books_price(data)
 
 
 
@@ -758,6 +789,11 @@ class DB:
                 SET isbn=?, title=?, author=?, category_id=?, price_cents=?, cost_cents=?, stock_qty=?, is_active=?
                 WHERE id=?;
             """, (isbn or None, title.strip(), author.strip(), category_id, int(price_cents), int(cost_cents), int(stock_qty), int(is_active), int(book_id)))
+            conn.commit()
+
+    def delete_book(self, book_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM books WHERE id=?;", (int(book_id),))
             conn.commit()
 
     def adjust_stock(self, book_id: int, delta: int) -> None:
@@ -1614,6 +1650,7 @@ class App:
         ttk.Button(top, text="Add (scan supported)", command=self.add_book).pack(side="left", padx=(20, 0))
         ttk.Button(top, text="Edit", command=self.edit_book).pack(side="left", padx=6)
         ttk.Button(top, text="Archive/Unarchive", command=self.toggle_book_active).pack(side="left", padx=6)
+        ttk.Button(top, text="Delete", command=self.delete_book).pack(side="left", padx=6)
         ttk.Button(top, text="Restock", command=self.restock_book).pack(side="left", padx=6)
         ttk.Button(top, text="Export CSV", command=self.export_books_csv).pack(side="right")
 
@@ -1868,58 +1905,157 @@ class App:
                     catname = nm
                     break
 
-        data = Dialog.ask_fields(self.root, "Edit Book", [
-            ("ISBN (optional)", "isbn"),
-            ("Title", "title"),
-            ("Author", "author"),
-            ("Category (optional)", "cat"),
-            ("Price (e.g. 12.99)", "price"),
-            ("Cost  (e.g. 7.50)", "cost"),
-            ("Stock qty", "stock"),
-            ("Active? (yes/no)", "active"),
-        ], initial={
-            "isbn": isbn or "",
-            "title": title,
-            "author": author,
-            "cat": catname,
-            "price": f"{int(price)/100:.2f}",
-            "cost": f"{int(cost)/100:.2f}",
-            "stock": str(stock),
-            "active": "yes" if int(active) else "no",
-        })
-        if not data:
-            return
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Edit Book")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
 
-        try:
-            price2 = dollars_to_cents(data["price"])
-            cost2 = dollars_to_cents(data["cost"])
-            stock2 = int(data["stock"])
-            active2 = 1 if data["active"].lower() in ("yes", "y", "1", "true") else 0
-            if stock2 < 0:
-                raise ValueError
-        except Exception:
-            messagebox.showerror("Bad input", "Check price/cost/stock/active.")
-            return
+        frame = ttk.Frame(dlg, padding=12)
+        frame.pack(fill="both", expand=True)
 
-        # category
-        cat_name = data["cat"].strip()
-        cat_id2 = None
-        if cat_name:
+        isbn_var = tk.StringVar(value=isbn or "")
+        title_var = tk.StringVar(value=title)
+        author_var = tk.StringVar(value=author)
+        cat_var = tk.StringVar(value=catname)
+        price_var = tk.StringVar(value=f"{int(price)/100:.2f}")
+        cost_var = tk.StringVar(value=f"{int(cost)/100:.2f}")
+        stock_var = tk.StringVar(value=str(stock))
+        active_var = tk.IntVar(value=1 if int(active) else 0)
+
+        def show_status(msg: str):
+            status_lbl.configure(text=msg)
+
+        def do_parse_price_field():
+            p = parse_price_from_scan(price_var.get())
+            if not p:
+                messagebox.showerror("Price not recognized", "Could not parse price from Price field.", parent=dlg)
+                return
+            price_var.set(p)
+            show_status("Price parsed/normalized.")
+
+        def do_scrape_price():
+            normalized = normalize_isbn(isbn_var.get())
+            if not normalized:
+                messagebox.showerror("Invalid ISBN", "Enter a valid ISBN to scrape price.", parent=dlg)
+                return
+            isbn_var.set(normalized)
+            fetched_price = fetch_book_price_google(normalized)
+            if not fetched_price:
+                messagebox.showerror("Price not found", "Could not fetch a price for this ISBN.", parent=dlg)
+                return
+            price_var.set(fetched_price)
+            show_status("Price scraped from Google Books.")
+
+        r = 0
+        ttk.Label(frame, text="ISBN (optional):").grid(row=r, column=0, sticky="w", pady=4)
+        ttk.Entry(frame, textvariable=isbn_var, width=46).grid(row=r, column=1, pady=4, sticky="w")
+        r += 1
+
+        ttk.Label(frame, text="Title:").grid(row=r, column=0, sticky="w", pady=4)
+        ttk.Entry(frame, textvariable=title_var, width=46).grid(row=r, column=1, pady=4, sticky="w")
+        r += 1
+
+        ttk.Label(frame, text="Author:").grid(row=r, column=0, sticky="w", pady=4)
+        ttk.Entry(frame, textvariable=author_var, width=46).grid(row=r, column=1, pady=4, sticky="w")
+        r += 1
+
+        ttk.Label(frame, text="Category (optional):").grid(row=r, column=0, sticky="w", pady=4)
+        ttk.Entry(frame, textvariable=cat_var, width=46).grid(row=r, column=1, pady=4, sticky="w")
+        r += 1
+
+        ttk.Label(frame, text="Price (e.g. 12.99):").grid(row=r, column=0, sticky="w", pady=4)
+        ttk.Entry(frame, textvariable=price_var, width=46).grid(row=r, column=1, pady=4, sticky="w")
+        price_btns = ttk.Frame(frame)
+        price_btns.grid(row=r, column=2, padx=8, sticky="w")
+        ttk.Button(price_btns, text="Parse Price", command=do_parse_price_field).pack(side="left")
+        ttk.Button(price_btns, text="Scrape Price", command=do_scrape_price).pack(side="left", padx=(6, 0))
+        r += 1
+
+        ttk.Label(frame, text="Cost (e.g. 7.50):").grid(row=r, column=0, sticky="w", pady=4)
+        ttk.Entry(frame, textvariable=cost_var, width=46).grid(row=r, column=1, pady=4, sticky="w")
+        r += 1
+
+        ttk.Label(frame, text="Stock qty:").grid(row=r, column=0, sticky="w", pady=4)
+        ttk.Entry(frame, textvariable=stock_var, width=46).grid(row=r, column=1, pady=4, sticky="w")
+        r += 1
+
+        ttk.Checkbutton(frame, text="Active", variable=active_var).grid(row=r, column=1, sticky="w", pady=4)
+        r += 1
+
+        status_lbl = ttk.Label(frame, text="", foreground="#444")
+        status_lbl.grid(row=r, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        r += 1
+
+        def on_save():
+            isbn_val = normalize_isbn(isbn_var.get()) or None
+            title_val = title_var.get().strip()
+            author_val = author_var.get().strip()
+            cat_name = cat_var.get().strip()
+            price_s = price_var.get().strip()
+            cost_s = cost_var.get().strip()
+            stock_s = stock_var.get().strip()
+
+            if not title_val or not author_val:
+                messagebox.showerror("Missing data", "Title and Author are required.", parent=dlg)
+                return
+
             try:
-                self.db.add_category(cat_name)
-            except sqlite3.IntegrityError:
-                pass
-            cats = self.db.list_categories(include_inactive=True)
-            cat_id2 = next((c[0] for c in cats if c[1] == cat_name), None)
+                price2 = dollars_to_cents(price_s)
+                cost2 = dollars_to_cents(cost_s)
+                stock2 = int(stock_s)
+                active2 = 1 if active_var.get() else 0
+                if stock2 < 0:
+                    raise ValueError
+            except Exception:
+                messagebox.showerror("Bad input", "Check price/cost/stock/active.", parent=dlg)
+                return
 
-        try:
-            self.db.update_book(bid, data["isbn"] or None, data["title"], data["author"], cat_id2, price2, cost2, stock2, active2)
-        except sqlite3.IntegrityError as e:
-            messagebox.showerror("DB error", f"Could not update.\n\n{e}")
+            cat_id2 = None
+            if cat_name:
+                try:
+                    self.db.add_category(cat_name)
+                except sqlite3.IntegrityError:
+                    pass
+                cats = self.db.list_categories(include_inactive=True)
+                cat_id2 = next((c[0] for c in cats if c[1] == cat_name), None)
+
+            try:
+                self.db.update_book(bid, isbn_val, title_val, author_val, cat_id2, price2, cost2, stock2, active2)
+            except sqlite3.IntegrityError as e:
+                messagebox.showerror("DB error", f"Could not update.\n\n{e}", parent=dlg)
+                return
+
+            dlg.destroy()
+            self.refresh_books()
+            self.refresh_reports()
+
+        btns = ttk.Frame(frame)
+        btns.grid(row=r, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="right")
+        ttk.Button(btns, text="Save", command=on_save).pack(side="right", padx=8)
+
+        self.root.wait_window(dlg)
+        return
+
+    def delete_book(self):
+        bid = self._selected_book_id()
+        if not bid:
+            messagebox.showerror("No selection", "Select a book.")
             return
-
+        row = self.db.get_book(bid)
+        if not row:
+            messagebox.showerror("Missing", "Book not found.")
+            return
+        title = row[2]
+        if not messagebox.askyesno("Delete Book", f"Delete '{title}' permanently?"):
+            return
+        try:
+            self.db.delete_book(bid)
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Delete failed", "Cannot delete a book with related sales/returns. Archive instead.")
+            return
         self.refresh_books()
-        self.refresh_reports()
 
     def toggle_book_active(self):
         bid = self._selected_book_id()
