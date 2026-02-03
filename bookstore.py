@@ -1737,6 +1737,18 @@ class App:
             price_var.set(p)
             show_status("Price parsed/normalized.")
 
+        def do_scrape_price():
+            isbn = normalize_isbn(isbn_var.get())
+            if not isbn:
+                messagebox.showerror("Invalid ISBN", "Enter a valid ISBN to scrape price.", parent=dlg)
+                return
+            fetched_price = fetch_book_price_google(isbn)
+            if not fetched_price:
+                messagebox.showerror("Price not found", "Could not fetch a price for this ISBN.", parent=dlg)
+                return
+            price_var.set(fetched_price)
+            show_status("Price scraped from Google Books.")
+
         # Layout
         r = 0
         ttk.Label(frame, text="Scan (ISBN, ISBN+price add-on, or price-only):").grid(row=r, column=0, sticky="w", pady=4)
@@ -1765,7 +1777,10 @@ class App:
 
         ttk.Label(frame, text="Price (e.g. 12.99):").grid(row=r, column=0, sticky="w", pady=4)
         ttk.Entry(frame, textvariable=price_var, width=46).grid(row=r, column=1, pady=4, sticky="w")
-        ttk.Button(frame, text="Parse Price", command=do_parse_price_field).grid(row=r, column=2, padx=8)
+        price_btns = ttk.Frame(frame)
+        price_btns.grid(row=r, column=2, padx=8, sticky="w")
+        ttk.Button(price_btns, text="Parse Price", command=do_parse_price_field).pack(side="left")
+        ttk.Button(price_btns, text="Scrape Price", command=do_scrape_price).pack(side="left", padx=(6, 0))
         r += 1
 
         ttk.Label(frame, text="Cost (e.g. 7.50):").grid(row=r, column=0, sticky="w", pady=4)
