@@ -228,11 +228,43 @@ def parse_scan_isbn_and_price(raw: str) -> Tuple[Optional[str], Optional[str]]:
     if isbn is None:
         isbn = normalize_isbn(raw)
 
-    # If no add-on parsed, try price parsing heuristics
+    # If no add-on parsed, try price parsing heuristics unless raw is just ISBN digits
     if price is None:
-        price = parse_price_from_scan(raw)
+        if isbn and digits and digits.isdigit() and len(digits) in (10, 13):
+            price = None
+        else:
+            price = parse_price_from_scan(raw)
 
     return isbn, price
+
+
+def fetch_book_price_google(isbn: str) -> Optional[str]:
+    """
+    Lookup book pricing via Google Books API.
+    Returns a string like "12.99" if available, otherwise None.
+    """
+    if not isbn:
+        return None
+    url = "https://www.googleapis.com/books/v1/volumes?" + urllib.parse.urlencode({
+        "q": f"isbn:{isbn}",
+        "maxResults": 1,
+    })
+    try:
+        with urllib.request.urlopen(url, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+    items = data.get("items") or []
+    if not items:
+        return None
+    sale_info = items[0].get("saleInfo") or {}
+    for key in ("listPrice", "retailPrice"):
+        entry = sale_info.get(key) or {}
+        amount = entry.get("amount")
+        if isinstance(amount, (int, float)):
+            return f"{float(amount):.2f}"
+    return None
 
 
 
@@ -515,6 +547,7 @@ class DB:
                     reason TEXT,
                     refund_method TEXT NOT NULL CHECK(refund_method IN ('cash','card','other')),
                     refund_cents INTEGER NOT NULL CHECK(refund_cents >= 0),
+                    refund_tax_cents INTEGER NOT NULL DEFAULT 0,
                     receipt_text TEXT NOT NULL,
                     FOREIGN KEY(sale_id) REFERENCES sales(id) ON DELETE RESTRICT
                 );
@@ -534,6 +567,10 @@ class DB:
             """)
 
             conn.commit()
+
+            if "refund_tax_cents" not in self._columns(conn, "returns"):
+                cur.execute("ALTER TABLE returns ADD COLUMN refund_tax_cents INTEGER NOT NULL DEFAULT 0;")
+                conn.commit()
 
             # Seed settings
             defaults = {
@@ -1122,11 +1159,11 @@ class DB:
 
         with self._connect() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT id, receipt_no, is_void FROM sales WHERE id=?;", (int(sale_id),))
+            cur.execute("SELECT id, receipt_no, is_void, tax_rate FROM sales WHERE id=?;", (int(sale_id),))
             s = cur.fetchone()
             if not s:
                 raise ValueError("sale missing")
-            _, receipt_no, is_void = s
+            _, receipt_no, is_void, tax_rate = s
             if int(is_void):
                 raise ValueError("cannot return voided sale")
 
@@ -1138,7 +1175,7 @@ class DB:
             orig = cur.fetchall()
             orig_map = {int(bid): {"qty": int(q), "unit": int(u)} for (bid, q, u) in orig}
 
-            refund_cents = 0
+            refund_subtotal_cents = 0
             receipt_lines = []
             for book_id, qty in items:
                 book_id = int(book_id)
@@ -1151,8 +1188,11 @@ class DB:
                     raise ValueError("return qty exceeds sold qty")
                 unit = orig_map[book_id]["unit"]
                 line_total = unit * qty
-                refund_cents += line_total
+                refund_subtotal_cents += line_total
                 receipt_lines.append((book_id, qty, unit, line_total))
+
+            refund_tax_cents = int(round(refund_subtotal_cents * float(tax_rate)))
+            refund_total_cents = refund_subtotal_cents + refund_tax_cents
 
             header = []
             store = self.get_setting("store_name")
@@ -1174,15 +1214,17 @@ class DB:
                 header.append(f"{title:34} {qty:>3} {cents_to_money(unit):>10} {cents_to_money(line_total):>10}")
 
             header.append("-" * 64)
-            header.append(f"{'REFUND:':>52} {cents_to_money(refund_cents):>10}")
+            header.append(f"{'Subtotal:':>52} {cents_to_money(refund_subtotal_cents):>10}")
+            header.append(f"{('Tax @ ' + str(tax_rate)):>52} {cents_to_money(refund_tax_cents):>10}")
+            header.append(f"{'REFUND:':>52} {cents_to_money(refund_total_cents):>10}")
             header.append(f"Refund method: {refund_method}")
             header.append("=" * 64)
             receipt_text = "\n".join(header)
 
             cur.execute("""
-                INSERT INTO returns(created_at, sale_id, reason, refund_method, refund_cents, receipt_text)
-                VALUES(?,?,?,?,?,?);
-            """, (created_at, int(sale_id), reason or "", refund_method, int(refund_cents), receipt_text))
+                INSERT INTO returns(created_at, sale_id, reason, refund_method, refund_cents, refund_tax_cents, receipt_text)
+                VALUES(?,?,?,?,?,?,?);
+            """, (created_at, int(sale_id), reason or "", refund_method, int(refund_total_cents), int(refund_tax_cents), receipt_text))
             return_id = int(cur.lastrowid)
 
             for (book_id, qty, unit, line_total) in receipt_lines:
@@ -1245,13 +1287,14 @@ class DB:
             cur.execute("""
                 SELECT substr(created_at,1,10) AS day,
                        SUM(refund_cents) AS refund_cents,
+                       SUM(refund_tax_cents) AS refund_tax_cents,
                        COUNT(*) AS return_count
                 FROM returns
                 WHERE substr(created_at,1,10) >= ?
                 GROUP BY day
                 ORDER BY day DESC;
             """, (start,))
-            returns = {d: (int(rc or 0), int(cnt or 0)) for (d, rc, cnt) in cur.fetchall()}
+            returns = {d: (int(rc or 0), int(rtax or 0), int(cnt or 0)) for (d, rc, rtax, cnt) in cur.fetchall()}
 
             out = []
             all_days = sorted(set(sales.keys()) | set(returns.keys()), reverse=True)
@@ -1259,7 +1302,8 @@ class DB:
                 rev_i, tax_i, scnt = sales.get(d, (0, 0, 0))
                 refund, rcnt = returns.get(d, (0, 0))
                 net = rev_i - refund
-                out.append((d, int(scnt or 0), rcnt, rev_i, refund, net, tax_i))
+                net_tax = tax_i - refund_tax
+                out.append((d, int(scnt or 0), rcnt, rev_i, refund, net, net_tax))
             return out
 
     def report_monthly(self):
@@ -1622,6 +1666,10 @@ class App:
                 isbn_var.set(isbn)
             if price:
                 price_var.set(price)
+            if isbn and not price and price_var.get().strip() in ("", "0", "0.00"):
+                fetched_price = fetch_book_price_google(isbn)
+                if fetched_price:
+                    price_var.set(fetched_price)
             if not isbn and not price:
                 messagebox.showerror("Unrecognized", "Could not parse ISBN or price from scan.", parent=dlg)
                 return
@@ -1649,6 +1697,10 @@ class App:
                 return
             title_var.set(info.get("title", ""))
             author_var.set(info.get("author", ""))
+            if price_var.get().strip() in ("", "0", "0.00"):
+                fetched_price = fetch_book_price_google(isbn)
+                if fetched_price:
+                    price_var.set(fetched_price)
             show_status("ISBN lookup OK (title/author filled).")
 
         def do_parse_price_field():
@@ -2733,10 +2785,32 @@ class App:
         if not path:
             return
         q = """
-            SELECT substr(created_at,1,10) AS day, SUM(tax_cents) AS tax_cents, SUM(total_cents) AS total_cents
-            FROM sales
-            WHERE is_void=0
-            GROUP BY day
+            WITH sales_daily AS (
+                SELECT substr(created_at,1,10) AS day,
+                       SUM(tax_cents) AS tax_cents,
+                       SUM(total_cents) AS total_cents
+                FROM sales
+                WHERE is_void=0
+                GROUP BY day
+            ),
+            returns_daily AS (
+                SELECT substr(created_at,1,10) AS day,
+                       SUM(refund_tax_cents) AS refund_tax_cents,
+                       SUM(refund_cents) AS refund_cents
+                FROM returns
+                GROUP BY day
+            )
+            SELECT COALESCE(sales_daily.day, returns_daily.day) AS day,
+                   IFNULL(sales_daily.tax_cents, 0) - IFNULL(returns_daily.refund_tax_cents, 0) AS tax_cents,
+                   IFNULL(sales_daily.total_cents, 0) - IFNULL(returns_daily.refund_cents, 0) AS total_cents
+            FROM sales_daily
+            LEFT JOIN returns_daily ON returns_daily.day = sales_daily.day
+            UNION
+            SELECT COALESCE(sales_daily.day, returns_daily.day) AS day,
+                   IFNULL(sales_daily.tax_cents, 0) - IFNULL(returns_daily.refund_tax_cents, 0) AS tax_cents,
+                   IFNULL(sales_daily.total_cents, 0) - IFNULL(returns_daily.refund_cents, 0) AS total_cents
+            FROM returns_daily
+            LEFT JOIN sales_daily ON sales_daily.day = returns_daily.day
             ORDER BY day DESC;
         """
         self.db.export_table_to_csv(q, ["day", "tax_cents", "total_cents"], path)
