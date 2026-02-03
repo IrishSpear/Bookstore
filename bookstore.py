@@ -27,6 +27,8 @@ import sqlite3
 import hashlib
 import hmac
 import secrets
+import time
+import urllib.error
 import urllib.request
 import urllib.parse
 import tkinter as tk
@@ -36,6 +38,7 @@ from typing import Optional, Dict, Any, List, Tuple
 
 
 DB_PATH = "bookstore.db"
+USER_AGENT = "BookstorePOS/1.0 (+https://openai.com)"
 
 
 # -------------------------- Money helpers (integer cents) --------------------------
@@ -278,24 +281,53 @@ def parse_google_books_price(data: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def fetch_book_price_google(isbn: str) -> Optional[str]:
+def fetch_json_with_retry(url: str, timeout: int = 8, retries: int = 2) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8")), None
+        except urllib.error.HTTPError as err:
+            last_error = f"HTTP {err.code}"
+            if err.code in (429, 500, 502, 503, 504) and attempt < retries:
+                retry_after = err.headers.get("Retry-After")
+                try:
+                    delay = int(retry_after) if retry_after else 1 + attempt * 2
+                except ValueError:
+                    delay = 1 + attempt * 2
+                time.sleep(delay)
+                continue
+            return None, last_error
+        except Exception:
+            last_error = "request failed"
+            return None, last_error
+    return None, last_error
+
+
+def fetch_book_price_google(isbn: str) -> Tuple[Optional[str], Optional[str]]:
     """
     Lookup book pricing via Google Books API.
-    Returns a string like "12.99" if available, otherwise None.
+    Returns (price, error). Price is like "12.99" if available.
     """
     if not isbn:
-        return None
-    url = "https://www.googleapis.com/books/v1/volumes?" + urllib.parse.urlencode({
+        return None, "missing isbn"
+    params = {
         "q": f"isbn:{isbn}",
         "maxResults": 1,
-    })
-    try:
-        with urllib.request.urlopen(url, timeout=8) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        return None
+    }
+    api_key = os.getenv("GOOGLE_BOOKS_API_KEY")
+    if api_key:
+        params["key"] = api_key
+    url = "https://www.googleapis.com/books/v1/volumes?" + urllib.parse.urlencode(params)
+    data, error = fetch_json_with_retry(url)
+    if not data:
+        if error == "HTTP 429":
+            return None, "rate limited (set GOOGLE_BOOKS_API_KEY to increase quota)"
+        return None, error or "no response"
 
-    return parse_google_books_price(data)
+    price = parse_google_books_price(data)
+    return price, None
 
 
 
@@ -311,10 +343,8 @@ def fetch_book_info_openlibrary(isbn: str) -> Optional[Dict[str, str]]:
         "format": "json",
         "jscmd": "data",
     })
-    try:
-        with urllib.request.urlopen(url, timeout=8) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception:
+    data, _error = fetch_json_with_retry(url)
+    if not data:
         return None
 
     key = f"ISBN:{isbn}"
@@ -1730,7 +1760,7 @@ class App:
             if price:
                 price_var.set(price)
             if isbn and not price and price_var.get().strip() in ("", "0", "0.00"):
-                fetched_price = fetch_book_price_google(isbn)
+                fetched_price, _err = fetch_book_price_google(isbn)
                 if fetched_price:
                     price_var.set(fetched_price)
             if not isbn and not price:
@@ -1761,7 +1791,7 @@ class App:
             title_var.set(info.get("title", ""))
             author_var.set(info.get("author", ""))
             if price_var.get().strip() in ("", "0", "0.00"):
-                fetched_price = fetch_book_price_google(isbn)
+                fetched_price, _err = fetch_book_price_google(isbn)
                 if fetched_price:
                     price_var.set(fetched_price)
             show_status("ISBN lookup OK (title/author filled).")
@@ -1779,9 +1809,12 @@ class App:
             if not isbn:
                 messagebox.showerror("Invalid ISBN", "Enter a valid ISBN to scrape price.", parent=dlg)
                 return
-            fetched_price = fetch_book_price_google(isbn)
+            fetched_price, err = fetch_book_price_google(isbn)
             if not fetched_price:
-                messagebox.showerror("Price not found", "Could not fetch a price for this ISBN.", parent=dlg)
+                if err:
+                    messagebox.showerror("Price not found", f"Could not fetch a price: {err}.", parent=dlg)
+                else:
+                    messagebox.showerror("Price not found", "Could not fetch a price for this ISBN.", parent=dlg)
                 return
             price_var.set(fetched_price)
             show_status("Price scraped from Google Books.")
@@ -1940,9 +1973,12 @@ class App:
                 messagebox.showerror("Invalid ISBN", "Enter a valid ISBN to scrape price.", parent=dlg)
                 return
             isbn_var.set(normalized)
-            fetched_price = fetch_book_price_google(normalized)
+            fetched_price, err = fetch_book_price_google(normalized)
             if not fetched_price:
-                messagebox.showerror("Price not found", "Could not fetch a price for this ISBN.", parent=dlg)
+                if err:
+                    messagebox.showerror("Price not found", f"Could not fetch a price: {err}.", parent=dlg)
+                else:
+                    messagebox.showerror("Price not found", "Could not fetch a price for this ISBN.", parent=dlg)
                 return
             price_var.set(fetched_price)
             show_status("Price scraped from Google Books.")
