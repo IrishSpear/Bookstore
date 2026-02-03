@@ -31,7 +31,6 @@ import time
 import urllib.error
 import urllib.request
 import urllib.parse
-import html
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime, date, timedelta
@@ -304,39 +303,6 @@ def fetch_json_with_retry(url: str, timeout: int = 8, retries: int = 2) -> Tuple
             last_error = "request failed"
             return None, last_error
     return None, last_error
-
-
-def parse_isbnsearch_price(html_text: str) -> Optional[str]:
-    if not html_text:
-        return None
-    text = html.unescape(html_text)
-    match = re.search(r"Price:\s*\$([0-9]+(?:\.[0-9]{2})?)", text)
-    if match:
-        return match.group(1)
-    return None
-
-
-def fetch_book_price_isbnsearch(isbn: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Lookup book pricing via ISBNsearch.org.
-    Returns (price, error). Price is like "12.99" if available.
-    """
-    if not isbn:
-        return None, "missing isbn"
-    url = f"https://isbnsearch.org/isbn/{urllib.parse.quote(isbn)}"
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            html_text = resp.read().decode("utf-8", errors="ignore")
-    except urllib.error.HTTPError as err:
-        return None, f"HTTP {err.code}"
-    except Exception:
-        return None, "request failed"
-    price = parse_isbnsearch_price(html_text)
-    if not price:
-        return None, "price not found on ISBNsearch"
-    return price, None
-
 
 
 def fetch_book_info_openlibrary(isbn: str) -> Optional[Dict[str, str]]:
@@ -1772,10 +1738,6 @@ class App:
                 isbn_var.set(isbn)
             if price:
                 price_var.set(price)
-            if isbn and not price and price_var.get().strip() in ("", "0", "0.00"):
-                fetched_price, _err = fetch_book_price_isbnsearch(isbn)
-                if fetched_price:
-                    price_var.set(fetched_price)
             if not isbn and not price:
                 messagebox.showerror("Unrecognized", "Could not parse ISBN or price from scan.", parent=dlg)
                 return
@@ -1803,10 +1765,6 @@ class App:
                 return
             title_var.set(info.get("title", ""))
             author_var.set(info.get("author", ""))
-            if price_var.get().strip() in ("", "0", "0.00"):
-                fetched_price, _err = fetch_book_price_isbnsearch(isbn)
-                if fetched_price:
-                    price_var.set(fetched_price)
             show_status("ISBN lookup OK (title/author filled).")
 
         def do_parse_price_field():
@@ -1816,21 +1774,6 @@ class App:
                 return
             price_var.set(p)
             show_status("Price parsed/normalized.")
-
-        def do_scrape_price():
-            isbn = normalize_isbn(isbn_var.get())
-            if not isbn:
-                messagebox.showerror("Invalid ISBN", "Enter a valid ISBN to scrape price.", parent=dlg)
-                return
-            fetched_price, err = fetch_book_price_isbnsearch(isbn)
-            if not fetched_price:
-                if err:
-                    messagebox.showerror("Price not found", f"Could not fetch a price: {err}.", parent=dlg)
-                else:
-                    messagebox.showerror("Price not found", "Could not fetch a price for this ISBN.", parent=dlg)
-                return
-            price_var.set(fetched_price)
-            show_status("Price scraped from ISBNsearch.")
 
         # Layout
         r = 0
@@ -1863,7 +1806,6 @@ class App:
         price_btns = ttk.Frame(frame)
         price_btns.grid(row=r, column=2, padx=8, sticky="w")
         ttk.Button(price_btns, text="Parse Price", command=do_parse_price_field).pack(side="left")
-        ttk.Button(price_btns, text="Scrape Price", command=do_scrape_price).pack(side="left", padx=(6, 0))
         r += 1
 
         ttk.Label(frame, text="Cost (e.g. 7.50):").grid(row=r, column=0, sticky="w", pady=4)
@@ -1980,22 +1922,6 @@ class App:
             price_var.set(p)
             show_status("Price parsed/normalized.")
 
-        def do_scrape_price():
-            normalized = normalize_isbn(isbn_var.get())
-            if not normalized:
-                messagebox.showerror("Invalid ISBN", "Enter a valid ISBN to scrape price.", parent=dlg)
-                return
-            isbn_var.set(normalized)
-            fetched_price, err = fetch_book_price_isbnsearch(normalized)
-            if not fetched_price:
-                if err:
-                    messagebox.showerror("Price not found", f"Could not fetch a price: {err}.", parent=dlg)
-                else:
-                    messagebox.showerror("Price not found", "Could not fetch a price for this ISBN.", parent=dlg)
-                return
-            price_var.set(fetched_price)
-            show_status("Price scraped from ISBNsearch.")
-
         r = 0
         ttk.Label(frame, text="ISBN (optional):").grid(row=r, column=0, sticky="w", pady=4)
         ttk.Entry(frame, textvariable=isbn_var, width=46).grid(row=r, column=1, pady=4, sticky="w")
@@ -2018,7 +1944,6 @@ class App:
         price_btns = ttk.Frame(frame)
         price_btns.grid(row=r, column=2, padx=8, sticky="w")
         ttk.Button(price_btns, text="Parse Price", command=do_parse_price_field).pack(side="left")
-        ttk.Button(price_btns, text="Scrape Price", command=do_scrape_price).pack(side="left", padx=(6, 0))
         r += 1
 
         ttk.Label(frame, text="Cost (e.g. 7.50):").grid(row=r, column=0, sticky="w", pady=4)
