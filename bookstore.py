@@ -31,6 +31,7 @@ import time
 import urllib.error
 import urllib.request
 import urllib.parse
+import html
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime, date, timedelta
@@ -305,32 +306,39 @@ def fetch_json_with_retry(url: str, timeout: int = 8, retries: int = 2) -> Tuple
     return None, last_error
 
 
-def fetch_book_price_google(isbn: str, api_key: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+def parse_amazon_price(html_text: str) -> Optional[str]:
+    if not html_text:
+        return None
+    text = html.unescape(html_text)
+    for match in re.finditer(r'class="a-offscreen">\s*\$([0-9]+(?:\.[0-9]{2})?)', text):
+        return match.group(1)
+    match = re.search(r"\$([0-9]+(?:\.[0-9]{2})?)", text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def fetch_book_price_amazon(isbn: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Lookup book pricing via Google Books API.
+    Lookup book pricing via Amazon search results.
     Returns (price, error). Price is like "12.99" if available.
     """
     if not isbn:
         return None, "missing isbn"
-    params = {
-        "q": f"isbn:{isbn}",
-        "maxResults": 1,
-    }
-    api_key = (api_key or "").strip() or os.getenv("GOOGLE_BOOKS_API_KEY")
-    if api_key:
-        params["key"] = api_key
-    url = "https://www.googleapis.com/books/v1/volumes?" + urllib.parse.urlencode(params)
-    data, error = fetch_json_with_retry(url)
-    if not data:
-        if error == "HTTP 429":
-            return None, "rate limited (set a Google Books API key to increase quota)"
-        if error == "HTTP 403":
-            if api_key:
-                return None, "forbidden (check Google Books API key restrictions)"
-            return None, "forbidden (set a Google Books API key to increase quota)"
-        return None, error or "no response"
-
-    price = parse_google_books_price(data)
+    url = "https://www.amazon.com/s?" + urllib.parse.urlencode({"k": isbn})
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            html_text = resp.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as err:
+        if err.code == 503:
+            return None, "service unavailable (possible bot protection)"
+        return None, f"HTTP {err.code}"
+    except Exception:
+        return None, "request failed"
+    price = parse_amazon_price(html_text)
+    if not price:
+        return None, "price not found in Amazon results"
     return price, None
 
 
@@ -1769,7 +1777,7 @@ class App:
             if price:
                 price_var.set(price)
             if isbn and not price and price_var.get().strip() in ("", "0", "0.00"):
-                fetched_price, _err = fetch_book_price_google(isbn, self._get_google_books_api_key())
+                fetched_price, _err = fetch_book_price_amazon(isbn)
                 if fetched_price:
                     price_var.set(fetched_price)
             if not isbn and not price:
@@ -1800,7 +1808,7 @@ class App:
             title_var.set(info.get("title", ""))
             author_var.set(info.get("author", ""))
             if price_var.get().strip() in ("", "0", "0.00"):
-                fetched_price, _err = fetch_book_price_google(isbn, self._get_google_books_api_key())
+                fetched_price, _err = fetch_book_price_amazon(isbn)
                 if fetched_price:
                     price_var.set(fetched_price)
             show_status("ISBN lookup OK (title/author filled).")
@@ -1818,7 +1826,7 @@ class App:
             if not isbn:
                 messagebox.showerror("Invalid ISBN", "Enter a valid ISBN to scrape price.", parent=dlg)
                 return
-            fetched_price, err = fetch_book_price_google(isbn, self._get_google_books_api_key())
+            fetched_price, err = fetch_book_price_amazon(isbn)
             if not fetched_price:
                 if err:
                     messagebox.showerror("Price not found", f"Could not fetch a price: {err}.", parent=dlg)
@@ -1826,7 +1834,7 @@ class App:
                     messagebox.showerror("Price not found", "Could not fetch a price for this ISBN.", parent=dlg)
                 return
             price_var.set(fetched_price)
-            show_status("Price scraped from Google Books.")
+            show_status("Price scraped from Amazon.")
 
         # Layout
         r = 0
@@ -1982,7 +1990,7 @@ class App:
                 messagebox.showerror("Invalid ISBN", "Enter a valid ISBN to scrape price.", parent=dlg)
                 return
             isbn_var.set(normalized)
-            fetched_price, err = fetch_book_price_google(normalized, self._get_google_books_api_key())
+            fetched_price, err = fetch_book_price_amazon(normalized)
             if not fetched_price:
                 if err:
                     messagebox.showerror("Price not found", f"Could not fetch a price: {err}.", parent=dlg)
@@ -1990,7 +1998,7 @@ class App:
                     messagebox.showerror("Price not found", "Could not fetch a price for this ISBN.", parent=dlg)
                 return
             price_var.set(fetched_price)
-            show_status("Price scraped from Google Books.")
+            show_status("Price scraped from Amazon.")
 
         r = 0
         ttk.Label(frame, text="ISBN (optional):").grid(row=r, column=0, sticky="w", pady=4)
