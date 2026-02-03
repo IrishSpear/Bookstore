@@ -305,7 +305,7 @@ def fetch_json_with_retry(url: str, timeout: int = 8, retries: int = 2) -> Tuple
     return None, last_error
 
 
-def fetch_book_price_google(isbn: str) -> Tuple[Optional[str], Optional[str]]:
+def fetch_book_price_google(isbn: str, api_key: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
     """
     Lookup book pricing via Google Books API.
     Returns (price, error). Price is like "12.99" if available.
@@ -316,14 +316,14 @@ def fetch_book_price_google(isbn: str) -> Tuple[Optional[str], Optional[str]]:
         "q": f"isbn:{isbn}",
         "maxResults": 1,
     }
-    api_key = os.getenv("GOOGLE_BOOKS_API_KEY")
+    api_key = (api_key or "").strip() or os.getenv("GOOGLE_BOOKS_API_KEY")
     if api_key:
         params["key"] = api_key
     url = "https://www.googleapis.com/books/v1/volumes?" + urllib.parse.urlencode(params)
     data, error = fetch_json_with_retry(url)
     if not data:
         if error == "HTTP 429":
-            return None, "rate limited (set GOOGLE_BOOKS_API_KEY to increase quota)"
+            return None, "rate limited (set a Google Books API key to increase quota)"
         return None, error or "no response"
 
     price = parse_google_books_price(data)
@@ -641,6 +641,7 @@ class DB:
                 "receipt_footer": "Thank you! Returns with receipt within 14 days.",
                 "receipt_prefix": "R",
                 "tax_rate_default": "0.00",
+                "google_books_api_key": "",
             }
             for k, v in defaults.items():
                 cur.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?);", (k, v))
@@ -1656,6 +1657,10 @@ class App:
             return False
         return True
 
+    def _get_google_books_api_key(self) -> Optional[str]:
+        key = self.db.get_setting("google_books_api_key").strip()
+        return key or None
+
     # ---------------- Books tab ----------------
     def _build_books_tab(self):
         tab = ttk.Frame(self.notebook)
@@ -1760,7 +1765,7 @@ class App:
             if price:
                 price_var.set(price)
             if isbn and not price and price_var.get().strip() in ("", "0", "0.00"):
-                fetched_price, _err = fetch_book_price_google(isbn)
+                fetched_price, _err = fetch_book_price_google(isbn, self._get_google_books_api_key())
                 if fetched_price:
                     price_var.set(fetched_price)
             if not isbn and not price:
@@ -1791,7 +1796,7 @@ class App:
             title_var.set(info.get("title", ""))
             author_var.set(info.get("author", ""))
             if price_var.get().strip() in ("", "0", "0.00"):
-                fetched_price, _err = fetch_book_price_google(isbn)
+                fetched_price, _err = fetch_book_price_google(isbn, self._get_google_books_api_key())
                 if fetched_price:
                     price_var.set(fetched_price)
             show_status("ISBN lookup OK (title/author filled).")
@@ -1809,7 +1814,7 @@ class App:
             if not isbn:
                 messagebox.showerror("Invalid ISBN", "Enter a valid ISBN to scrape price.", parent=dlg)
                 return
-            fetched_price, err = fetch_book_price_google(isbn)
+            fetched_price, err = fetch_book_price_google(isbn, self._get_google_books_api_key())
             if not fetched_price:
                 if err:
                     messagebox.showerror("Price not found", f"Could not fetch a price: {err}.", parent=dlg)
@@ -1973,7 +1978,7 @@ class App:
                 messagebox.showerror("Invalid ISBN", "Enter a valid ISBN to scrape price.", parent=dlg)
                 return
             isbn_var.set(normalized)
-            fetched_price, err = fetch_book_price_google(normalized)
+            fetched_price, err = fetch_book_price_google(normalized, self._get_google_books_api_key())
             if not fetched_price:
                 if err:
                     messagebox.showerror("Price not found", f"Could not fetch a price: {err}.", parent=dlg)
@@ -3059,12 +3064,13 @@ class App:
         self.set_footer = tk.StringVar(value=self.db.get_setting("receipt_footer"))
         self.set_prefix = tk.StringVar(value=self.db.get_setting("receipt_prefix"))
         self.set_taxdef = tk.StringVar(value=self.db.get_setting("tax_rate_default"))
+        self.set_google_books_key = tk.StringVar(value=self.db.get_setting("google_books_api_key"))
 
-        def row(parent, label, var):
+        def row(parent, label, var, show: str = ""):
             r = ttk.Frame(parent)
             r.pack(fill="x", padx=10, pady=4)
             ttk.Label(r, text=label, width=18).pack(side="left")
-            ttk.Entry(r, textvariable=var, width=50).pack(side="left")
+            ttk.Entry(r, textvariable=var, width=50, show=show).pack(side="left")
 
         row(settings, "Store name:", self.set_store)
         row(settings, "Address:", self.set_addr)
@@ -3072,6 +3078,7 @@ class App:
         row(settings, "Footer:", self.set_footer)
         row(settings, "Receipt prefix:", self.set_prefix)
         row(settings, "Default tax:", self.set_taxdef)
+        row(settings, "Google Books key:", self.set_google_books_key, show="*")
         ttk.Button(settings, text="Save Settings", command=self.save_settings).pack(anchor="e", padx=10, pady=(6, 10))
 
         backup = ttk.LabelFrame(left, text="Backup / Restore")
@@ -3160,6 +3167,7 @@ class App:
         self.db.set_setting("receipt_footer", self.set_footer.get().strip())
         self.db.set_setting("receipt_prefix", self.set_prefix.get().strip() or "R")
         self.db.set_setting("tax_rate_default", self.set_taxdef.get().strip() or "0.00")
+        self.db.set_setting("google_books_api_key", self.set_google_books_key.get().strip())
         self.tax_var.set(self.db.get_setting("tax_rate_default") or "0.00")
         messagebox.showinfo("Saved", "Settings saved.")
 
