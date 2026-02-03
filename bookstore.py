@@ -306,39 +306,35 @@ def fetch_json_with_retry(url: str, timeout: int = 8, retries: int = 2) -> Tuple
     return None, last_error
 
 
-def parse_amazon_price(html_text: str) -> Optional[str]:
+def parse_isbnsearch_price(html_text: str) -> Optional[str]:
     if not html_text:
         return None
     text = html.unescape(html_text)
-    for match in re.finditer(r'class="a-offscreen">\s*\$([0-9]+(?:\.[0-9]{2})?)', text):
-        return match.group(1)
-    match = re.search(r"\$([0-9]+(?:\.[0-9]{2})?)", text)
+    match = re.search(r"Price:\s*\$([0-9]+(?:\.[0-9]{2})?)", text)
     if match:
         return match.group(1)
     return None
 
 
-def fetch_book_price_amazon(isbn: str) -> Tuple[Optional[str], Optional[str]]:
+def fetch_book_price_isbnsearch(isbn: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Lookup book pricing via Amazon search results.
+    Lookup book pricing via ISBNsearch.org.
     Returns (price, error). Price is like "12.99" if available.
     """
     if not isbn:
         return None, "missing isbn"
-    url = "https://www.amazon.com/s?" + urllib.parse.urlencode({"k": isbn})
+    url = f"https://isbnsearch.org/isbn/{urllib.parse.quote(isbn)}"
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=8) as resp:
             html_text = resp.read().decode("utf-8", errors="ignore")
     except urllib.error.HTTPError as err:
-        if err.code == 503:
-            return None, "service unavailable (possible bot protection)"
         return None, f"HTTP {err.code}"
     except Exception:
         return None, "request failed"
-    price = parse_amazon_price(html_text)
+    price = parse_isbnsearch_price(html_text)
     if not price:
-        return None, "price not found in Amazon results"
+        return None, "price not found on ISBNsearch"
     return price, None
 
 
@@ -1777,7 +1773,7 @@ class App:
             if price:
                 price_var.set(price)
             if isbn and not price and price_var.get().strip() in ("", "0", "0.00"):
-                fetched_price, _err = fetch_book_price_amazon(isbn)
+                fetched_price, _err = fetch_book_price_isbnsearch(isbn)
                 if fetched_price:
                     price_var.set(fetched_price)
             if not isbn and not price:
@@ -1808,7 +1804,7 @@ class App:
             title_var.set(info.get("title", ""))
             author_var.set(info.get("author", ""))
             if price_var.get().strip() in ("", "0", "0.00"):
-                fetched_price, _err = fetch_book_price_amazon(isbn)
+                fetched_price, _err = fetch_book_price_isbnsearch(isbn)
                 if fetched_price:
                     price_var.set(fetched_price)
             show_status("ISBN lookup OK (title/author filled).")
@@ -1826,7 +1822,7 @@ class App:
             if not isbn:
                 messagebox.showerror("Invalid ISBN", "Enter a valid ISBN to scrape price.", parent=dlg)
                 return
-            fetched_price, err = fetch_book_price_amazon(isbn)
+            fetched_price, err = fetch_book_price_isbnsearch(isbn)
             if not fetched_price:
                 if err:
                     messagebox.showerror("Price not found", f"Could not fetch a price: {err}.", parent=dlg)
@@ -1834,7 +1830,7 @@ class App:
                     messagebox.showerror("Price not found", "Could not fetch a price for this ISBN.", parent=dlg)
                 return
             price_var.set(fetched_price)
-            show_status("Price scraped from Amazon.")
+            show_status("Price scraped from ISBNsearch.")
 
         # Layout
         r = 0
@@ -1990,7 +1986,7 @@ class App:
                 messagebox.showerror("Invalid ISBN", "Enter a valid ISBN to scrape price.", parent=dlg)
                 return
             isbn_var.set(normalized)
-            fetched_price, err = fetch_book_price_amazon(normalized)
+            fetched_price, err = fetch_book_price_isbnsearch(normalized)
             if not fetched_price:
                 if err:
                     messagebox.showerror("Price not found", f"Could not fetch a price: {err}.", parent=dlg)
@@ -1998,7 +1994,7 @@ class App:
                     messagebox.showerror("Price not found", "Could not fetch a price for this ISBN.", parent=dlg)
                 return
             price_var.set(fetched_price)
-            show_status("Price scraped from Amazon.")
+            show_status("Price scraped from ISBNsearch.")
 
         r = 0
         ttk.Label(frame, text="ISBN (optional):").grid(row=r, column=0, sticky="w", pady=4)
