@@ -1239,7 +1239,8 @@ class DB:
                 GROUP BY day
                 ORDER BY day DESC;
             """, (start,))
-            sales = cur.fetchall()
+            sales_rows = cur.fetchall()
+            sales = {d: (int(rev or 0), int(tax or 0), int(scnt or 0)) for (d, rev, tax, scnt) in sales_rows}
 
             cur.execute("""
                 SELECT substr(created_at,1,10) AS day,
@@ -1253,10 +1254,10 @@ class DB:
             returns = {d: (int(rc or 0), int(cnt or 0)) for (d, rc, cnt) in cur.fetchall()}
 
             out = []
-            for (d, rev, tax, scnt) in sales:
+            all_days = sorted(set(sales.keys()) | set(returns.keys()), reverse=True)
+            for d in all_days:
+                rev_i, tax_i, scnt = sales.get(d, (0, 0, 0))
                 refund, rcnt = returns.get(d, (0, 0))
-                rev_i = int(rev or 0)
-                tax_i = int(tax or 0)
                 net = rev_i - refund
                 out.append((d, int(scnt or 0), rcnt, rev_i, refund, net, tax_i))
             return out
@@ -1274,21 +1275,63 @@ class DB:
                 GROUP BY month
                 ORDER BY month DESC;
             """)
-            return [(a, int(b or 0), int(c or 0), int(d or 0)) for (a, b, c, d) in cur.fetchall()]
+            sales = {a: (int(b or 0), int(c or 0), int(d or 0)) for (a, b, c, d) in cur.fetchall()}
+
+            cur.execute("""
+                SELECT substr(created_at,1,7) AS month,
+                       SUM(refund_cents) AS refund_cents
+                FROM returns
+                GROUP BY month
+                ORDER BY month DESC;
+            """)
+            returns = {a: int(b or 0) for (a, b) in cur.fetchall()}
+
+            out = []
+            all_months = sorted(set(sales.keys()) | set(returns.keys()), reverse=True)
+            for month in all_months:
+                rev, tax, scnt = sales.get(month, (0, 0, 0))
+                refund = returns.get(month, 0)
+                net_rev = rev - refund
+                out.append((month, net_rev, tax, scnt))
+            return out
 
     def report_top_books(self, limit: int = 10):
         with self._connect() as conn:
             cur = conn.cursor()
             cur.execute("""
-                SELECT b.title,
-                       SUM(si.quantity) AS units,
-                       SUM(si.line_total_cents) AS revenue_cents,
-                       SUM((si.unit_price_cents - si.unit_cost_cents) * si.quantity - si.line_discount_cents) AS profit_cents
-                FROM sale_items si
-                JOIN sales s ON s.id = si.sale_id
-                JOIN books b ON b.id = si.book_id
-                WHERE s.is_void=0
-                GROUP BY b.id
+                WITH sold AS (
+                    SELECT b.id AS book_id,
+                           b.title AS title,
+                           SUM(si.quantity) AS units,
+                           SUM(si.line_total_cents) AS revenue_cents,
+                           SUM((si.unit_price_cents - si.unit_cost_cents) * si.quantity - si.line_discount_cents) AS profit_cents
+                    FROM sale_items si
+                    JOIN sales s ON s.id = si.sale_id
+                    JOIN books b ON b.id = si.book_id
+                    WHERE s.is_void=0
+                    GROUP BY b.id
+                ),
+                sale_cost AS (
+                    SELECT sale_id, book_id, MAX(unit_cost_cents) AS unit_cost_cents
+                    FROM sale_items
+                    GROUP BY sale_id, book_id
+                ),
+                returned AS (
+                    SELECT ri.book_id AS book_id,
+                           SUM(ri.quantity) AS units,
+                           SUM(ri.line_total_cents) AS revenue_cents,
+                           SUM((ri.unit_price_cents - sc.unit_cost_cents) * ri.quantity) AS profit_cents
+                    FROM return_items ri
+                    JOIN returns r ON r.id = ri.return_id
+                    JOIN sale_cost sc ON sc.sale_id = r.sale_id AND sc.book_id = ri.book_id
+                    GROUP BY ri.book_id
+                )
+                SELECT sold.title,
+                       sold.units - IFNULL(returned.units, 0) AS units,
+                       sold.revenue_cents - IFNULL(returned.revenue_cents, 0) AS revenue_cents,
+                       sold.profit_cents - IFNULL(returned.profit_cents, 0) AS profit_cents
+                FROM sold
+                LEFT JOIN returned ON returned.book_id = sold.book_id
                 ORDER BY revenue_cents DESC
                 LIMIT ?;
             """, (int(limit),))
@@ -1298,11 +1341,20 @@ class DB:
         with self._connect() as conn:
             cur = conn.cursor()
             cur.execute("""
+                WITH refunds AS (
+                    SELECT s.customer_id AS customer_id,
+                           SUM(r.refund_cents) AS refund_cents
+                    FROM returns r
+                    JOIN sales s ON s.id = r.sale_id
+                    WHERE s.is_void=0
+                    GROUP BY s.customer_id
+                )
                 SELECT c.name,
                        COUNT(*) AS sales,
-                       SUM(s.total_cents) AS revenue_cents
+                       SUM(s.total_cents) - IFNULL(refunds.refund_cents, 0) AS revenue_cents
                 FROM sales s
                 JOIN customers c ON c.id = s.customer_id
+                LEFT JOIN refunds ON refunds.customer_id = s.customer_id
                 WHERE s.is_void=0
                 GROUP BY c.id
                 ORDER BY revenue_cents DESC
@@ -1314,15 +1366,38 @@ class DB:
         with self._connect() as conn:
             cur = conn.cursor()
             cur.execute("""
-                SELECT IFNULL(cat.name,'Uncategorized') AS category,
-                       SUM(si.line_total_cents) AS revenue_cents,
-                       SUM((si.unit_price_cents - si.unit_cost_cents) * si.quantity - si.line_discount_cents) AS profit_cents
-                FROM sale_items si
-                JOIN sales s ON s.id = si.sale_id
-                JOIN books b ON b.id = si.book_id
-                LEFT JOIN categories cat ON cat.id = b.category_id
-                WHERE s.is_void=0
-                GROUP BY category
+                WITH sold AS (
+                    SELECT IFNULL(cat.name,'Uncategorized') AS category,
+                           SUM(si.line_total_cents) AS revenue_cents,
+                           SUM((si.unit_price_cents - si.unit_cost_cents) * si.quantity - si.line_discount_cents) AS profit_cents
+                    FROM sale_items si
+                    JOIN sales s ON s.id = si.sale_id
+                    JOIN books b ON b.id = si.book_id
+                    LEFT JOIN categories cat ON cat.id = b.category_id
+                    WHERE s.is_void=0
+                    GROUP BY category
+                ),
+                sale_cost AS (
+                    SELECT sale_id, book_id, MAX(unit_cost_cents) AS unit_cost_cents
+                    FROM sale_items
+                    GROUP BY sale_id, book_id
+                ),
+                returned AS (
+                    SELECT IFNULL(cat.name,'Uncategorized') AS category,
+                           SUM(ri.line_total_cents) AS revenue_cents,
+                           SUM((ri.unit_price_cents - sc.unit_cost_cents) * ri.quantity) AS profit_cents
+                    FROM return_items ri
+                    JOIN returns r ON r.id = ri.return_id
+                    JOIN sale_cost sc ON sc.sale_id = r.sale_id AND sc.book_id = ri.book_id
+                    JOIN books b ON b.id = ri.book_id
+                    LEFT JOIN categories cat ON cat.id = b.category_id
+                    GROUP BY category
+                )
+                SELECT sold.category,
+                       sold.revenue_cents - IFNULL(returned.revenue_cents, 0) AS revenue_cents,
+                       sold.profit_cents - IFNULL(returned.profit_cents, 0) AS profit_cents
+                FROM sold
+                LEFT JOIN returned ON returned.category = sold.category
                 ORDER BY revenue_cents DESC;
             """)
             return [(a, int(b or 0), int(c or 0)) for (a, b, c) in cur.fetchall()]
