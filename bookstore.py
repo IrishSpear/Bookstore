@@ -1313,10 +1313,7 @@ class DB:
             all_days = sorted(set(sales.keys()) | set(returns.keys()), reverse=True)
             for d in all_days:
                 rev_i, tax_i, scnt = sales.get(d, (0, 0, 0))
-                vals = returns.get(d, (0, 0, 0))
-                refund = vals[0] if len(vals) > 0 else 0
-                refund_tax = vals[1] if len(vals) > 1 else 0
-                rcnt = vals[2] if len(vals) > 2 else 0
+                refund, refund_tax, rcnt = returns.get(d, (0, 0, 0))
                 net = rev_i - refund
                 net_tax = tax_i - refund_tax
                 out.append((d, int(scnt or 0), rcnt, rev_i, refund, net, net_tax))
@@ -1362,9 +1359,7 @@ class DB:
             all_months = sorted(set(sales.keys()) | set(returns.keys()), reverse=True)
             for month in all_months:
                 rev, tax, scnt = sales.get(month, (0, 0, 0))
-                vals = returns.get(month, (0, 0))
-                refund = vals[0] if len(vals) > 0 else 0
-                refund_tax = vals[1] if len(vals) > 1 else 0
+                refund, refund_tax = returns.get(month, (0, 0))
                 net_rev = rev - refund
                 net_tax = tax - refund_tax
                 out.append((month, net_rev, net_tax, scnt))
